@@ -1,8 +1,8 @@
 <?php
 /*
-Plugin Name: Frontend Uploader
-Description: Allow your visitors to upload content and moderate it.
-Author: Rinat Khaziev, Daniel Bachhuber
+Plugin Name: Frontend Uploader & Trimmer
+Description: Allow your visitors to upload content and trim it.
+Author: Shivansh Rajpoot
 Version: 1.3.1
 Author URI: http://digitallyconscious.com
 
@@ -40,6 +40,7 @@ class Frontend_Uploader {
 
 	public $allowed_mime_types;
 	public $html;
+	public $media_path;
 	public $settings;
 	public $settings_slug = 'frontend_uploader_settings';
 	public $is_debug = false;
@@ -67,7 +68,6 @@ class Frontend_Uploader {
 	function __construct() {
 		// Init
 		add_action( 'init', array( $this, 'action_init' ) );
-
 		// HTML helper to render HTML elements
 		$this->html = new Html_Helper;
 
@@ -257,12 +257,10 @@ class Frontend_Uploader {
 	function _upload_files( $post_id = 0 ) {
 		// Only filter mimes just before the upload
 		add_filter( 'upload_mimes', array( $this, '_get_mime_types' ), 999 );
-
 		$media_ids = $errors = array();
 		// Bail if there are no files
 		if ( empty( $_FILES ) )
 			return array();
-
 		// File field name could be user defined, so we just get the first file
 		$files = current( $_FILES );
 
@@ -334,6 +332,7 @@ class Frontend_Uploader {
 				$media_ids[] = $upload_id;
 			else
 				$errors['fu-error-media'][] = $k['name'];
+			$this->media_path = $k['name'];
 		}
 
 		/**
@@ -351,7 +350,7 @@ class Frontend_Uploader {
 		// Allow additional setup
 		// Pass array of attachment ids
 		do_action( 'fu_after_upload', $media_ids, $success, $post_id );
-		return array( 'success' => $success, 'media_ids' => $media_ids, 'errors' => $errors );
+		return array( 'success' => $success, 'media_ids' => $media_ids, 'errors' => $errors);
 	}
 
 	/**
@@ -506,24 +505,55 @@ class Frontend_Uploader {
 	 */
 	function upload_content() {
 		$fields = $result = array();
+		if (!empty($_POST['time_from']) && !empty($_POST['time_to'])) {
+			$fullsize_path 		= get_attached_file(base64_decode($_POST['media_id']));
+			$fullsize_path_arr 	= explode('/',$fullsize_path);
+			$filename 			= end($fullsize_path_arr);
+			$last_index 		= count($fullsize_path_arr)-1;
+			$file_extn 			= explode('.',$filename)[1];
+			unset($fullsize_path_arr[$last_index]);
+			$random_name = function ($length) {
+			    $key = '';
+			    $keys = array_merge(range(0, 9), range('a', 'z'));
 
-		// Bail if something fishy is going on
-		if ( !wp_verify_nonce( $_POST['fu_nonce'], FU_NONCE ) ) {
-			wp_safe_redirect( add_query_arg( array( 'response' => 'fu-error', 'errors' =>  array( 'fu-nonce-failure' => 1 ) ), wp_get_referer() ) );
+			    for ($i = 0; $i < $length; $i++) {
+			        $key .= $keys[array_rand($keys)];
+			    }
+
+			    return $key;
+			};
+			$new_file_name = $random_name(10).'.'.$file_extn;
+			$new_file_path = implode('/',$fullsize_path_arr).'/'.$new_file_name;
+			require_once FU_ROOT . '/lib/php/vendor/autoload.php';
+			if ($file_extn == 'mp4') {
+				echo shell_exec("/usr/bin/ffmpeg -y -i ".$fullsize_path." -ss 00:".$_POST['time_from']." -t 00:".$_POST['time_to']." -vcodec libx264 -strict -2 -acodec aac -b:v 1000k -refs 6 -coder 1 -sc_threshold 40 -flags +loop -me_range 16 -subq 7 -i_qfactor 0.71 -qcomp 0.6 -qdiff 4 -trellis 1 -b:a 128k ".$new_file_path." ");
+			}
+			/*print_r("/usr/bin/ffmpeg -y -i ".$fullsize_path." -ss  -t 00:00:10 -vcodec libx264 -strict -2 -acodec aac -b:v 1000k -refs 6 -coder 1 -sc_threshold 40 -flags +loop -me_range 16 -subq 7 -i_qfactor 0.71 -qcomp 0.6 -qdiff 4 -trellis 1 -b:a 128k ".$new_file_path." ");*/
+			$url_arr = explode('/',wp_get_attachment_url(base64_decode($_POST['media_id'])));
+			$l_index = end(array_keys($url_arr));
+			$url_arr[$l_index] =  $new_file_name;
+			$new_url = implode('/',$url_arr);
+			wp_safe_redirect( add_query_arg(['response'=>'fu-trimmed','media_id' => base64_encode($new_url),'trimmed' => true], wp_get_referer() ) );
 			exit;
+		}else{
+			// Bail if something fishy is going on
+			if ( !wp_verify_nonce( $_POST['fu_nonce'], FU_NONCE ) ) {
+				wp_safe_redirect( add_query_arg( array( 'response' => 'fu-error', 'errors' =>  array( 'fu-nonce-failure' => 1 ) ), wp_get_referer() ) );
+				exit;
+			}
+
+			// Bail if supplied post type is not allowed
+			if ( isset( $_POST['post_type'] ) && ! $this->is_allowed_post_type( sanitize_key( $_POST['post_type'] ) ) ) {
+				wp_safe_redirect( add_query_arg( array( 'response' => 'fu-error', 'errors' => array( 'fu-disallowed-post-type' => sanitize_key( $_POST['post_type'] ) ) ), wp_get_referer() ) );
+				exit;
+			}
+
+			$form_post_id = isset( $_POST['form_post_id'] ) ? (int) $_POST['form_post_id'] : 0;
+			$hash = sanitize_text_field( $_POST['ff'] );
+			$this->form_fields = !empty( $this->form_fields ) ? $this->form_fields : $this->_get_fields_for_form( $form_post_id, $hash );
+
+			$layout = isset( $_POST['form_layout'] ) && !empty( $_POST['form_layout'] ) ? $_POST['form_layout'] : 'image';			
 		}
-
-		// Bail if supplied post type is not allowed
-		if ( isset( $_POST['post_type'] ) && ! $this->is_allowed_post_type( sanitize_key( $_POST['post_type'] ) ) ) {
-			wp_safe_redirect( add_query_arg( array( 'response' => 'fu-error', 'errors' => array( 'fu-disallowed-post-type' => sanitize_key( $_POST['post_type'] ) ) ), wp_get_referer() ) );
-			exit;
-		}
-
-		$form_post_id = isset( $_POST['form_post_id'] ) ? (int) $_POST['form_post_id'] : 0;
-		$hash = sanitize_text_field( $_POST['ff'] );
-		$this->form_fields = !empty( $this->form_fields ) ? $this->form_fields : $this->_get_fields_for_form( $form_post_id, $hash );
-
-		$layout = isset( $_POST['form_layout'] ) && !empty( $_POST['form_layout'] ) ? $_POST['form_layout'] : 'image';
 
 		/**
 		 * Utility hook 'fu_should_process_content_upload': maybe terminate upload early (useful for Akismet integration, etc)
@@ -644,6 +674,7 @@ class Frontend_Uploader {
 			// If it's media uploads
 			if ( isset( $result['media_ids'] ) && !isset( $result['post_id'] ) )
 				$query_args['response'] = 'fu-sent';
+				$query_args['media_id'] = base64_encode($result['media_ids'][0]);
 		}
 
 		// Something went wrong, let's indicate it
@@ -1080,13 +1111,14 @@ class Frontend_Uploader {
 					'category' => '',
 					'suppress_default_fields' => false,
 					'append_to_post' => false,
+					'additional' => ''
 				), $atts ) );
 
 		$post_id = (int) $post_id;
 
 		$this->enqueue_scripts();
 
-		$form_layout = in_array( $form_layout, array( 'post', 'image', 'media', 'post_image', 'post_media' ), true ) ? $form_layout : 'media';
+		$form_layout = in_array( $form_layout, array( 'post', 'image', 'media', 'post_image', 'post_media','trimmer' ), true ) ? $form_layout : 'media';
 
 		ob_start();
 ?>
@@ -1094,8 +1126,7 @@ class Frontend_Uploader {
 	 <div class="ugc-inner-wrapper">
 		 <h2><?php echo esc_html( $title ) ?></h2>
 <?php
-		if ( !empty( $_GET ) )
-			$this->_display_response_notices( $_GET );
+		if ( !empty( $_GET ) ) $this->_display_response_notices( $_GET );
 
 		$textarea_desc = __( 'Description', 'frontend-uploader' );
 		$file_desc = __( 'Your Media Files', 'frontend-uploader' );
@@ -1128,7 +1159,7 @@ class Frontend_Uploader {
 				), null, 'input' );
 		}
 
-		if ( !( isset( $this->settings['suppress_default_fields'] ) && 'on' == $this->settings['suppress_default_fields'] ) && ( $suppress_default_fields === false ) ) {
+		if ( !( isset( $this->settings['suppress_default_fields'] ) && 'on' == $this->settings['suppress_default_fields'] ) && ( $suppress_default_fields === false ) && $additional != 'trimmer') {
 
 			// Display title field
 			echo $this->shortcode_content_parser( array(
@@ -1175,8 +1206,7 @@ class Frontend_Uploader {
 		}
 
 		// Parse nested shortcodes
-		if ( $content )
-			echo do_shortcode( $content );
+		if ( $content && $additional != 'trimmer') echo do_shortcode( $content );
 
 		if ( !( isset( $this->settings['suppress_default_fields'] ) && 'on' == $this->settings['suppress_default_fields'] ) && ( $suppress_default_fields === false ) ) {
 
@@ -1193,11 +1223,33 @@ class Frontend_Uploader {
 					), null, 'input' );
 			}
 
-			if ( $this->settings['enable_recaptcha_protection' ] == 'on' )
-				echo fu_get_recaptcha_markup();
+			if ( $this->settings['enable_recaptcha_protection' ] == 'on' ) echo fu_get_recaptcha_markup();
+			if ( $additional == 'trimmer' && !empty($_GET['media_id']) ) {
+				@$meta_data = wp_get_attachment_metadata(base64_decode($_GET['media_id']));
+				if (!empty($meta_data)) {
+					$media_length = $meta_data['length_formatted'];
+					$_media_length = explode(':',$media_length);
+					$total 	= ((int)$_media_length[0]*60)+((int)$_media_length[1]);
+					echo '
+					<div>
+						<label>Time From</label>
+						<div id="time-range">
+						    <p>Time Range: <span class="slider-time">00:00 </span> - <span class="slider-time2">'.$media_length. '</span>
 
+						    </p>
+						    <div class="sliders_step1">
+						        <div id="slider-range" data-max="'.$total.'"></div>
+						        <input type="hidden" id="time_from" name="time_from"  value=""/>
+						        <input type="hidden" id="time_to" name="time_to" value=""/>
+						    </div>
+						</div>
+					</div>
+					<input type="hidden" name="media_id" value="'.$_GET['media_id'].'">
+					';
+					$submit_button = 'Trim';
+				}
+			}
 			do_action( 'fu_additional_html', $this );
-
 			echo $this->shortcode_content_parser( array(
 					'type' => 'submit',
 					'role' => 'internal',
@@ -1308,6 +1360,19 @@ class Frontend_Uploader {
 	}
 
 	/**
+	 * [fu-upload-player] shortcode callback to render upload results notice
+	 *
+	 * @param [type] $atts [description]
+	 * @return [type]  [description]
+	 */
+	function upload_player_shortcode( $atts ) {
+		$this->enqueue_scripts();
+		ob_start();
+		$this->_display_response_notices( $_GET );
+		return ob_get_clean();
+	}
+
+	/**
 	 * Returns html chunk of single notice
 	 *
 	 * @since 0.4
@@ -1319,8 +1384,13 @@ class Frontend_Uploader {
 	function _notice_html( $message, $class ) {
 		if ( empty( $message ) || empty( $class ) )
 			return;
-
-		return sprintf( '<p class="ugc-notice %1$s">%2$s</p>', esc_attr( $class ), esc_html( $message ) );
+		$url = wp_get_attachment_url(base64_decode($_GET['media_id']));
+		$src = !empty($url) ? $url : base64_decode($_GET['media_id']);
+		$video_player = '<video width="320" height="240" controls id="media_element">
+							  <source src="'.$src.'" type="video/mp4">
+									Your browser does not support the video tag.
+							</video>';
+		return sprintf( '<p class="ugc-notice %1$s">%2$s</p>%3$s%4$s', esc_attr( $class ), esc_html( $message ), $video_player ,wp_get_attachment_url( base64_decode($_GET['media_id']) ));
 	}
 
 	/**
@@ -1355,6 +1425,9 @@ class Frontend_Uploader {
 				'text' => __( "Your submission failed spam checks", 'frontend-uploader' ),
 				'class' => 'failure',
 			),
+			'fu-trimmed' => array(
+				'text' => __( "Your file was trimmed.", 'frontend-uploader' ),
+				'class' => 'failure'),
 		) );
 
 		if ( isset( $res['response'] ) && isset( $map[ $res['response'] ] ) )
@@ -1430,11 +1503,17 @@ class Frontend_Uploader {
 	 * Enqueue our assets
 	 */
 	function enqueue_scripts() {
-		wp_enqueue_style( 'frontend-uploader', FU_URL . 'lib/css/frontend-uploader.css' );
+		wp_enqueue_style( 'rangeslider', FU_URL . 'lib/css/rangeslider.css' );
+		wp_enqueue_style( 'jquery-ui', 'http://ajax.googleapis.com/ajax/libs/jqueryui/1.11.2/themes/smoothness/jquery-ui.css');
+		wp_enqueue_script('jquery-ui', 'http://ajax.googleapis.com/ajax/libs/jqueryui/1.11.2/jquery-ui.min.js');
+		wp_enqueue_script('jquery', 'https://ajax.googleapis.com/ajax/libs/jquery/3.1.1/jquery.min.js', array('jquery', 'jquery-ui'));
 		wp_enqueue_script( 'jquery-validate', FU_URL . 'lib/js/validate/jquery.validate.min.js', array( 'jquery', 'underscore' ) );
+		wp_enqueue_style( 'frontend-uploader', FU_URL . 'lib/css/frontend-uploader.css' );
 		wp_enqueue_script( 'jquery-validate-additional', FU_URL . 'lib/js/validate/additional-methods.min.js', array( 'jquery', 'underscore' ) );
 		wp_enqueue_script( 'fu-underscore-string', FU_URL . 'lib/js/underscore.string.min.js', array( 'jquery', 'underscore' ) );
 		wp_enqueue_script( 'frontend-uploader-js', FU_URL . 'lib/js/frontend-uploader.js', array( 'jquery', 'jquery-validate' ) );
+		wp_enqueue_script( 'rangeslider-js', FU_URL . 'lib/js/rangeslider.js', array( 'jquery', 'jquery-validate' ) );
+		wp_enqueue_script( 'custom-js', FU_URL . 'lib/js/custom.js', array( 'jquery', 'jquery-validate' ) );
 		// Include localization strings for default messages of validation plugin
 		if ( $this->lang ) {
 			$relative_path = "lib/js/validate/localization/messages_{$this->lang_short}.js";
